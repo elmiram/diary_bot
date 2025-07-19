@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import threading
 import time
 import re
@@ -110,8 +110,9 @@ def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
         "properties": properties,
         "children": build_notion_page_content(user_data)
     }
-    if user_data.get("icon"):
-        payload["icon"] = {"type": "emoji", "emoji": user_data["icon"]}
+    icon = user_data.get("icon")
+    if icon:
+        payload["icon"] = {"type": "emoji", "emoji": icon}
 
     response_data = notion_api_request("post", "https://api.notion.com/v1/pages", json=payload)
     if response_data:
@@ -119,7 +120,7 @@ def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
         page_id = response_data["id"]
         if "diary_entries" not in context.bot_data:
             context.bot_data["diary_entries"] = {}
-        context.bot_data["diary_entries"][today_obj.isoformat()] = page_id
+        context.bot_data["diary_entries"][today_obj.isoformat()] = {'page_id': page_id, 'icon': icon}
 
 def update_notion_page_properties(page_id, user_data):
     """Updates the properties (icon, checkboxes, tags) of an existing Notion page."""
@@ -281,7 +282,7 @@ async def done_checkboxes(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     if context.user_data.get("is_update"):
         today = get_today_iso()
-        page_id = context.bot_data.get("diary_entries", {}).get(today)
+        page_id = context.bot_data.get("diary_entries", {}).get(today, {}).get('page_id')
         if page_id:
             update_notion_page_properties(page_id, context.user_data)
         return await start_update(query.message, context)
@@ -309,9 +310,12 @@ async def emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if context.user_data.get("is_update"):
         today = get_today_iso()
-        page_id = context.bot_data.get("diary_entries", {}).get(today)
-        if page_id:
+        entry_data = context.bot_data.get("diary_entries", {}).get(today)
+        if entry_data and entry_data.get('page_id'):
+            page_id = entry_data['page_id']
             update_notion_page_properties(page_id, context.user_data)
+            # Update the icon in our persistent data
+            entry_data['icon'] = context.user_data.get("icon")
         return await start_update(update.message, context)
     else:
         return await ask_photos(update.message, context)
@@ -346,7 +350,7 @@ async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Finishes the diary entry and saves to Notion."""
     if context.user_data.get("is_update"):
         today = get_today_iso()
-        page_id = context.bot_data.get("diary_entries", {}).get(today)
+        page_id = context.bot_data.get("diary_entries", {}).get(today, {}).get('page_id')
         if page_id and context.user_data.get("photos"):
             new_photo_blocks = []
             for photo_url in context.user_data["photos"]:
@@ -403,7 +407,7 @@ async def updating_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def update_text_field(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str) -> int:
     """Appends new text to the correct section in a Notion page."""
     today = get_today_iso()
-    page_id = context.bot_data.get("diary_entries", {}).get(today)
+    page_id = context.bot_data.get("diary_entries", {}).get(today, {}).get('page_id')
     new_text = update.message.text
 
     if not page_id:
@@ -480,6 +484,61 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
+# --- New Emoji Timeline Command ---
+async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Displays a timeline of emojis used in the current year."""
+    diary_entries = context.bot_data.get("diary_entries", {})
+    today = date.today()
+    current_year = today.year
+    
+    # Check if the user wants the full year view (e.g., /emojis full)
+    full_year_mode = context.args and context.args[0].lower() in ['full', 'all']
+
+    if full_year_mode:
+        start_of_year = date(current_year, 1, 1)
+        day_count = (today - start_of_year).days + 1
+        
+        timeline_symbols = []
+        for i in range(day_count):
+            current_day = start_of_year + timedelta(days=i)
+            iso_date = current_day.isoformat()
+            entry = diary_entries.get(iso_date)
+            
+            if entry and entry.get('icon'):
+                timeline_symbols.append(entry['icon'])
+            else:
+                timeline_symbols.append('•')
+        
+        emoji_timeline = "".join(timeline_symbols)
+        if not emoji_timeline:
+             await update.message.reply_text(f"No entries found for {current_year} yet!")
+             return
+        
+        await update.message.reply_text(f"Your {current_year} daily emoji timeline:\n{emoji_timeline}")
+
+    else: # Default mode (only show used emojis)
+        year_entries = []
+        for iso_date, data in diary_entries.items():
+            if iso_date.startswith(str(current_year)) and data.get('icon'):
+                try:
+                    entry_date = date.fromisoformat(iso_date)
+                    year_entries.append((entry_date, data['icon']))
+                except ValueError:
+                    continue
+        
+        if not year_entries:
+            await update.message.reply_text(
+                f"No emoji entries found for {current_year} yet! "
+                f"Try `/emojis full` to see the full year view."
+            )
+            return
+            
+        year_entries.sort()
+        emoji_timeline = "".join([icon for dt, icon in year_entries])
+        
+        await update.message.reply_text(f"Your {current_year} used emojis:\n{emoji_timeline}")
+
+
 # --- Reminder and Scheduling Functions ---
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -514,20 +573,54 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
+async def post_init_sync_from_notion(application: Application) -> None:
+    """Populates the persistence file by fetching data from Notion if it's empty."""
+    if application.bot_data.get('diary_entries'):
+        logger.info("Persistence file already contains data. Skipping Notion sync.")
+        return
+
+    logger.info("Persistence file is empty. Syncing from Notion...")
+    query_payload = {
+        "filter": {
+            "property": "Tags",
+            "multi_select": {
+                "contains": "Daily"
+            }
+        }
+    }
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    response_data = notion_api_request("post", url, json=query_payload)
+
+    if not response_data:
+        logger.warning("Could not fetch data from Notion for initial sync.")
+        return
+    
+    synced_entries = {}
+    for page in response_data.get("results", []):
+        try:
+            page_id = page['id']
+            icon_data = page.get('icon')
+            icon = icon_data.get('emoji') if icon_data else None
+            
+            # Use the reliable 'created_time' field for the date
+            created_time_str = page['created_time']
+            entry_date = datetime.fromisoformat(created_time_str.replace("Z", "+00:00")).date()
+            iso_date = entry_date.isoformat()
+            
+            synced_entries[iso_date] = {'page_id': page_id, 'icon': icon}
+        except (KeyError, IndexError, ValueError) as e:
+            logger.warning(f"Skipping page during sync due to parsing error: {e}")
+            continue
+    
+    application.bot_data['diary_entries'] = synced_entries
+    logger.info(f"Successfully synced {len(synced_entries)} entries from Notion.")
+    await application.persistence.flush()
+
+
 def main() -> None:
     logger.info("Bot started. Polling Telegram for updates every 30 seconds.")
     persistence = PicklePersistence(filepath="diary_bot_persistence")
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
-
-    # --- Clean up old entries from persistence file on startup ---
-    if 'diary_entries' in application.bot_data:
-        today = get_today_iso()
-        old_dates = [d for d in application.bot_data['diary_entries'] if d != today]
-        for d in old_dates:
-            del application.bot_data['diary_entries'][d]
-        if old_dates:
-            logger.info(f"Cleaned up {len(old_dates)} old entries from persistence file.")
-
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).post_init(post_init_sync_from_notion).build()
 
     # --- User filter to ensure only you can use the bot ---
     user_filter = filters.User(user_id=int(YOUR_CHAT_ID))
@@ -554,6 +647,8 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("emojis", show_emojis, filters=user_filter))
+
     schedule.every().day.at("20:00").do(lambda: application.job_queue.run_once(daily_prompt, 0, chat_id=int(YOUR_CHAT_ID), name=f"daily_prompt_{YOUR_CHAT_ID}"))
     
     scheduler_thread = threading.Thread(target=run_scheduler)
