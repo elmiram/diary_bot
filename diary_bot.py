@@ -519,6 +519,16 @@ def main() -> None:
     persistence = PicklePersistence(filepath="diary_bot_persistence")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
 
+    # --- Clean up old entries from persistence file on startup ---
+    if 'diary_entries' in application.bot_data:
+        today = get_today_iso()
+        old_dates = [d for d in application.bot_data['diary_entries'] if d != today]
+        for d in old_dates:
+            del application.bot_data['diary_entries'][d]
+        if old_dates:
+            logger.info(f"Cleaned up {len(old_dates)} old entries from persistence file.")
+
+
     # --- User filter to ensure only you can use the bot ---
     user_filter = filters.User(user_id=int(YOUR_CHAT_ID))
 
