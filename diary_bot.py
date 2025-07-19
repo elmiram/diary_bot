@@ -1,12 +1,11 @@
 import logging
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 import threading
-import time
+import time as thread_time # Renamed to avoid conflict with datetime.time
 import re
 
 import requests
-import schedule
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -558,6 +557,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         context.job_queue.run_once(send_reminder, next_reminder_delays[current_reminder], chat_id=chat_id, name=f"reminder_{chat_id}", data={"reminder_count": current_reminder + 1})
 
 async def daily_prompt(context: ContextTypes.DEFAULT_TYPE):
+    """The job function for the daily prompt."""
     chat_id = context.job.chat_id
     if not context.bot_data.get("diary_entries", {}).get(get_today_iso()):
         reply_markup = ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
@@ -567,11 +567,6 @@ async def daily_prompt(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
         context.job_queue.run_once(send_reminder, 2 * 60 * 60, chat_id=chat_id, name=f"reminder_{chat_id}", data={"reminder_count": 0})
-
-def run_scheduler():
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
 
 async def post_init_sync_from_notion(application: Application) -> None:
     """Populates the persistence file by fetching data from Notion if it's empty."""
@@ -649,12 +644,15 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("emojis", show_emojis, filters=user_filter))
 
-    schedule.every().day.at("20:00").do(lambda: application.job_queue.run_once(daily_prompt, 0, chat_id=int(YOUR_CHAT_ID), name=f"daily_prompt_{YOUR_CHAT_ID}"))
+    # Schedule the daily prompt using the built-in JobQueue
+    job_queue = application.job_queue
+    job_queue.run_daily(
+        daily_prompt,
+        time(hour=20, minute=0), # 8 PM
+        chat_id=int(YOUR_CHAT_ID),
+        name=f"daily_prompt_{YOUR_CHAT_ID}"
+    )
     
-    scheduler_thread = threading.Thread(target=run_scheduler)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
-
     application.run_polling(timeout=30)
 
 if __name__ == "__main__":
