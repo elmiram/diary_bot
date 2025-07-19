@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+venv/
+.env
+
+# Secrets
+passwords.py 
+
+# Data
+diary_bot_persistence
