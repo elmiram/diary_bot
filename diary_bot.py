@@ -7,6 +7,7 @@ import re
 
 import requests
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -557,65 +558,90 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         context.job_queue.run_once(send_reminder, next_reminder_delays[current_reminder], chat_id=chat_id, name=f"reminder_{chat_id}", data={"reminder_count": current_reminder + 1})
 
 async def daily_prompt(context: ContextTypes.DEFAULT_TYPE):
-    """The job function for the daily prompt."""
+    """The job function for the daily prompt. Retries on network failure."""
     chat_id = context.job.chat_id
-    if not context.bot_data.get("diary_entries", {}).get(get_today_iso()):
+    retry_count = context.job.data.get("retry_count", 0) if context.job.data else 0
+
+    if context.bot_data.get("diary_entries", {}).get(get_today_iso()):
+        return
+
+    try:
         reply_markup = ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
         await context.bot.send_message(
-            chat_id, 
+            chat_id,
             text="👋 Good evening! Time for your daily diary entry.",
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
         )
+        logger.info("Daily prompt sent successfully.")
+        # Schedule the normal reminder chain only on successful send
         context.job_queue.run_once(send_reminder, 2 * 60 * 60, chat_id=chat_id, name=f"reminder_{chat_id}", data={"reminder_count": 0})
+    except NetworkError as e:
+        logger.warning(f"Network error sending daily prompt (Attempt {retry_count + 1}): {e}")
+        if retry_count < 3:
+            # Schedule a retry in 5 minutes
+            context.job_queue.run_once(
+                daily_prompt,
+                when=5 * 60,
+                chat_id=chat_id,
+                name=f"daily_prompt_retry_{chat_id}",
+                data={"retry_count": retry_count + 1},
+            )
+        else:
+            logger.error("Failed to send daily prompt after 3 retries. Will try again tomorrow.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in daily_prompt: {e}")
 
-async def post_init_sync_from_notion(application: Application) -> None:
-    """Populates the persistence file by fetching data from Notion if it's empty."""
-    if application.bot_data.get('diary_entries'):
+async def post_init_setup(application: Application) -> None:
+    """Runs after the bot is initialized. Syncs from Notion and checks for missed prompts."""
+    # --- Sync from Notion on first run ---
+    if not application.bot_data.get('diary_entries'):
+        logger.info("Persistence file is empty. Syncing from Notion...")
+        query_payload = { "filter": { "property": "Tags", "multi_select": { "contains": "Daily" } } }
+        url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+        response_data = notion_api_request("post", url, json=query_payload)
+
+        if response_data:
+            synced_entries = {}
+            for page in response_data.get("results", []):
+                try:
+                    page_id = page['id']
+                    icon_data = page.get('icon')
+                    icon = icon_data.get('emoji') if icon_data else None
+                    created_time_str = page['created_time']
+                    entry_date = datetime.fromisoformat(created_time_str.replace("Z", "+00:00")).date()
+                    iso_date = entry_date.isoformat()
+                    synced_entries[iso_date] = {'page_id': page_id, 'icon': icon}
+                except (KeyError, IndexError, ValueError) as e:
+                    logger.warning(f"Skipping page during sync due to parsing error: {e}")
+                    continue
+            
+            application.bot_data['diary_entries'] = synced_entries
+            logger.info(f"Successfully synced {len(synced_entries)} entries from Notion.")
+            await application.persistence.flush()
+        else:
+            logger.warning("Could not fetch data from Notion for initial sync.")
+    else:
         logger.info("Persistence file already contains data. Skipping Notion sync.")
-        return
 
-    logger.info("Persistence file is empty. Syncing from Notion...")
-    query_payload = {
-        "filter": {
-            "property": "Tags",
-            "multi_select": {
-                "contains": "Daily"
-            }
-        }
-    }
-    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    response_data = notion_api_request("post", url, json=query_payload)
+    # --- Check for missed daily prompt on startup ---
+    today = get_today_iso()
+    prompt_time = time(hour=20, minute=0)
+    now = datetime.now().time()
 
-    if not response_data:
-        logger.warning("Could not fetch data from Notion for initial sync.")
-        return
-    
-    synced_entries = {}
-    for page in response_data.get("results", []):
-        try:
-            page_id = page['id']
-            icon_data = page.get('icon')
-            icon = icon_data.get('emoji') if icon_data else None
-            
-            # Use the reliable 'created_time' field for the date
-            created_time_str = page['created_time']
-            entry_date = datetime.fromisoformat(created_time_str.replace("Z", "+00:00")).date()
-            iso_date = entry_date.isoformat()
-            
-            synced_entries[iso_date] = {'page_id': page_id, 'icon': icon}
-        except (KeyError, IndexError, ValueError) as e:
-            logger.warning(f"Skipping page during sync due to parsing error: {e}")
-            continue
-    
-    application.bot_data['diary_entries'] = synced_entries
-    logger.info(f"Successfully synced {len(synced_entries)} entries from Notion.")
-    await application.persistence.flush()
+    if now > prompt_time and not application.bot_data.get("diary_entries", {}).get(today):
+        logger.info("Bot started after prompt time and no entry found for today. Sending prompt now.")
+        application.job_queue.run_once(
+            daily_prompt,
+            when=0,
+            chat_id=int(YOUR_CHAT_ID),
+            name=f"missed_prompt_startup_{YOUR_CHAT_ID}"
+        )
 
 
 def main() -> None:
     logger.info("Bot started. Polling Telegram for updates every 30 seconds.")
     persistence = PicklePersistence(filepath="diary_bot_persistence")
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).post_init(post_init_sync_from_notion).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).post_init(post_init_setup).build()
 
     # --- User filter to ensure only you can use the bot ---
     user_filter = filters.User(user_id=int(YOUR_CHAT_ID))
