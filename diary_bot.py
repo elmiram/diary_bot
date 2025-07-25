@@ -4,6 +4,7 @@ from datetime import datetime, date, time, timedelta
 import threading
 import time as thread_time # Renamed to avoid conflict with datetime.time
 import re
+import pytz
 
 import requests
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
@@ -20,6 +21,9 @@ from telegram.ext import (
 )
 
 from passwords import NOTION_API_KEY, NOTION_DATABASE_ID, TELEGRAM_BOT_TOKEN, YOUR_CHAT_ID
+
+# --- Configuration ---
+TIMEZONE = pytz.timezone('Europe/Zurich')
 
 # Enable logging
 logging.basicConfig(
@@ -48,8 +52,8 @@ logger = logging.getLogger(__name__)
 # --- Notion API Functions ---
 
 def get_today_iso():
-    """Returns today's date in YYYY-MM-DD format."""
-    return date.today().isoformat()
+    """Returns today's date in YYYY-MM-DD format, respecting the configured timezone."""
+    return datetime.now(TIMEZONE).date().isoformat()
 
 def notion_api_request(method, url, **kwargs):
     """Helper function for making Notion API requests."""
@@ -94,8 +98,8 @@ def build_notion_page_content(user_data):
 
 def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
     """Creates a new page in the Notion database."""
-    today_obj = date.today()
-    title = today_obj.strftime("%a %d %b %Y") # e.g., "Sat 19 Jul 2025"
+    today_obj = datetime.now(TIMEZONE).date()
+    title = today_obj.strftime("%a %d %b %Y") # e.g., "Sat 25 Jul 2025"
     
     properties = {
         "Name": {"title": [{"text": {"content": title}}]},
@@ -488,7 +492,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays a timeline of emojis used in the current year."""
     diary_entries = context.bot_data.get("diary_entries", {})
-    today = date.today()
+    today = datetime.now(TIMEZONE).date()
     current_year = today.year
     
     # Check if the user wants the full year view (e.g., /emojis full)
@@ -543,8 +547,12 @@ async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id, current_reminder = job.chat_id, job.data.get("reminder_count", 0)
-    if context.bot_data.get("diary_entries", {}).get(get_today_iso()): return
+    
+    if context.bot_data.get("diary_entries", {}).get(get_today_iso()):
+        logger.info("Skipping reminder as an entry for today already exists.")
+        return
 
+    logger.info(f"Sending reminder #{current_reminder + 1}.")
     reminder_messages = [
         "Just a gentle nudge! Don't forget your diary entry. ✨",
         "It's me again! Friendly reminder to capture today's moments.",
@@ -625,8 +633,8 @@ async def post_init_setup(application: Application) -> None:
 
     # --- Check for missed daily prompt on startup ---
     today = get_today_iso()
-    prompt_time = time(hour=20, minute=0)
-    now = datetime.now().time()
+    prompt_time = time(hour=20, minute=0, tzinfo=TIMEZONE)
+    now = datetime.now(TIMEZONE).time()
 
     if now > prompt_time and not application.bot_data.get("diary_entries", {}).get(today):
         logger.info("Bot started after prompt time and no entry found for today. Sending prompt now.")
@@ -674,7 +682,7 @@ def main() -> None:
     job_queue = application.job_queue
     job_queue.run_daily(
         daily_prompt,
-        time(hour=20, minute=0), # 8 PM
+        time(hour=20, minute=0, tzinfo=TIMEZONE), # 8 PM in the specified timezone
         chat_id=int(YOUR_CHAT_ID),
         name=f"daily_prompt_{YOUR_CHAT_ID}"
     )
