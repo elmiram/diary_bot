@@ -50,7 +50,8 @@ logger = logging.getLogger(__name__)
     ASKING_EMOJI,
     ASKING_CHECKBOXES,
     ASKING_SCORE,
-) = range(14)
+    ASKING_DATE,
+) = range(15)
 
 # --- Notion API Functions ---
 
@@ -105,12 +106,13 @@ def build_notion_page_content(user_data):
 
 def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
     """Creates a new page in the Notion database."""
-    today_obj = datetime.now(TIMEZONE).date()
-    title = today_obj.strftime("%a %d %b %Y") # e.g., "Sat 25 Jul 2025"
-    
+    entry_date = user_data.get("entry_date") or datetime.now(TIMEZONE).date()
+    title = entry_date.strftime("%a %d %b %Y") # e.g., "Sat 25 Jul 2025"
+
     properties = {
         "Name": {"title": [{"text": {"content": title}}]},
         "Tags": {"multi_select": [{"name": "Daily"}]},
+        "Date": {"date": {"start": entry_date.isoformat()}},
         "S": {"checkbox": user_data.get("checkbox_s", False)},
         "Sleep separate": {"checkbox": user_data.get("checkbox_sleep_separate", False)},
         "Tears": {"checkbox": user_data.get("checkbox_tears", False)},
@@ -133,7 +135,7 @@ def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
         page_id = response_data["id"]
         if "diary_entries" not in context.bot_data:
             context.bot_data["diary_entries"] = {}
-        context.bot_data["diary_entries"][today_obj.isoformat()] = {'page_id': page_id, 'icon': icon}
+        context.bot_data["diary_entries"][entry_date.isoformat()] = {'page_id': page_id, 'icon': icon}
 
 def update_notion_page_properties(page_id, user_data):
     """Updates the properties (icon, checkboxes, tags) of an existing Notion page."""
@@ -220,6 +222,62 @@ async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def cancel_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Okay, I won't change anything.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+# --- Backfill Flow ---
+def get_date_picker_keyboard():
+    """Generates an inline keyboard with the last 14 days for backfill date selection."""
+    today = datetime.now(TIMEZONE).date()
+    keyboard = []
+    for i in range(1, 15):
+        d = today - timedelta(days=i)
+        keyboard.append([InlineKeyboardButton(d.strftime("%a %d %b %Y"), callback_data=f"date_{d.isoformat()}")])
+    return InlineKeyboardMarkup(keyboard)
+
+async def backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for the backfill command. Asks the user to pick a date."""
+    context.user_data.clear()
+    context.user_data["is_backfill"] = True
+    await update.message.reply_text(
+        "Which date would you like to add an entry for?\n\n"
+        "Pick from the list or type a date (YYYY-MM-DD or DD/MM/YYYY):",
+        reply_markup=get_date_picker_keyboard(),
+    )
+    return ASKING_DATE
+
+async def backfill_date_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles date selection via inline keyboard in backfill flow."""
+    query = update.callback_query
+    await query.answer()
+    iso_date = query.data.split("_", 1)[1]
+    entry_date = date.fromisoformat(iso_date)
+    context.user_data["entry_date"] = entry_date
+    await query.edit_message_text(f"Got it, creating entry for {entry_date.strftime('%a %d %b %Y')}.")
+    return await ask_photos(query.message, context)
+
+def parse_date_input(text: str):
+    """Parses a date string in YYYY-MM-DD or DD/MM/YYYY or DD.MM.YYYY format."""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+async def backfill_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles date input as free text in backfill flow."""
+    entry_date = parse_date_input(update.message.text)
+    if not entry_date:
+        await update.message.reply_text(
+            "Couldn't parse that date. Please use YYYY-MM-DD or DD/MM/YYYY (e.g. 2026-06-20 or 20/06/2026).",
+            reply_markup=get_date_picker_keyboard(),
+        )
+        return ASKING_DATE
+    if entry_date > datetime.now(TIMEZONE).date():
+        await update.message.reply_text("That date is in the future. Please pick a past date.")
+        return ASKING_DATE
+    context.user_data["entry_date"] = entry_date
+    await update.message.reply_text(f"Got it, creating entry for {entry_date.strftime('%a %d %b %Y')}.")
+    return await ask_photos(update.message, context)
 
 async def memorable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["memorable"] = update.message.text
@@ -710,8 +768,12 @@ def main() -> None:
     user_filter = filters.User(user_id=int(YOUR_CHAT_ID))
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start, filters=user_filter)],
+        entry_points=[
+            CommandHandler("start", start, filters=user_filter),
+            CommandHandler("backfill", backfill, filters=user_filter),
+        ],
         states={
+            ASKING_DATE: [CallbackQueryHandler(backfill_date_button, pattern="^date_"), MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, backfill_date_text)],
             ASKING_UPDATE: [MessageHandler(filters.Regex("^Yes, update it$") & user_filter, start_update), MessageHandler(filters.Regex("^No, cancel$") & user_filter, cancel_update)],
             MEMORABLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, memorable)],
             WORRIES: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, worries)],
