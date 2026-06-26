@@ -40,14 +40,16 @@ logger = logging.getLogger(__name__)
     MEMORABLE,
     GRATEFUL,
     WORRIES,
+    TODOS,
     PHOTO,
     UPDATING_MENU,
     UPDATING_MEMORABLE,
     UPDATING_GRATEFUL,
     UPDATING_WORRIES,
+    UPDATING_TODOS,
     ASKING_EMOJI,
     ASKING_CHECKBOXES,
-) = range(11)
+) = range(13)
 
 # --- Notion API Functions ---
 
@@ -75,25 +77,29 @@ def notion_api_request(method, url, **kwargs):
 def build_notion_page_content(user_data):
     """Builds the list of blocks for a Notion page from user data."""
     children = []
+    if user_data.get("photos"):
+        for photo_url in user_data["photos"]:
+            children.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": photo_url}}})
     if user_data.get("memorable"):
         children.extend([
             {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "How was the day?"}}]}},
             {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": user_data["memorable"]}}]}},
-        ])
-    if user_data.get("grateful"):
-        children.extend([
-            {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Grateful for"}}]}},
-            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": user_data["grateful"]}}]}},
         ])
     if user_data.get("worries"):
         children.extend([
             {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Worries"}}]}},
             {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": user_data["worries"]}}]}},
         ])
-    if user_data.get("photos"):
-        children.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Pics"}}]}})
-        for photo_url in user_data["photos"]:
-            children.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": photo_url}}})
+    if user_data.get("grateful"):
+        children.extend([
+            {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Grateful for"}}]}},
+            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": user_data["grateful"]}}]}},
+        ])
+    if user_data.get("todos"):
+        children.extend([
+            {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Todos and ideas"}}]}},
+            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": user_data["todos"]}}]}},
+        ])
     return children
 
 def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
@@ -194,8 +200,9 @@ async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["is_update"] = True
     keyboard = [
         [InlineKeyboardButton("📝 Edit 'How was the day?'", callback_data="update_memorable")],
-        [InlineKeyboardButton("🙏 Edit 'Grateful for'", callback_data="update_grateful")],
         [InlineKeyboardButton("😟 Edit Worries", callback_data="update_worries")],
+        [InlineKeyboardButton("🙏 Edit 'Grateful for'", callback_data="update_grateful")],
+        [InlineKeyboardButton("💡 Edit Todos and ideas", callback_data="update_todos")],
         [InlineKeyboardButton("🖼️ Add Pics", callback_data="update_photos")],
         [InlineKeyboardButton("☑️ Edit Checkboxes", callback_data="update_checkboxes")],
         [InlineKeyboardButton("🙂 Edit Emoji", callback_data="update_emoji")],
@@ -217,19 +224,25 @@ async def cancel_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def memorable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["memorable"] = update.message.text
-    await update.message.reply_text("Thank you. Now, what are you grateful for today?")
-    return GRATEFUL
-
-async def grateful(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["grateful"] = update.message.text
     await update.message.reply_text("Got it. Anything you're worried about? You can type 'none' if not.")
     return WORRIES
 
 async def worries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stores worries and proceeds to the checkbox section."""
     text = update.message.text
     if text.lower() not in ['none', 'no', 'nope']:
         context.user_data["worries"] = text
+    await update.message.reply_text("What are you grateful for today?")
+    return GRATEFUL
+
+async def grateful(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["grateful"] = update.message.text
+    await update.message.reply_text("Any todos or ideas to note down? You can type 'none' if not.")
+    return TODOS
+
+async def todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    if text.lower() not in ['none', 'no', 'nope']:
+        context.user_data["todos"] = text
     return await ask_checkboxes(update, context)
 
 # --- Checkbox Handling ---
@@ -382,8 +395,9 @@ async def updating_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     actions = {
         "update_memorable": ("Okay, send me the new text to add for the 'How was the day?' section.", UPDATING_MEMORABLE),
-        "update_grateful": ("Got it. What new things are you grateful for today?", UPDATING_GRATEFUL),
         "update_worries": ("Okay, what worries would you like to add?", UPDATING_WORRIES),
+        "update_grateful": ("Got it. What new things are you grateful for today?", UPDATING_GRATEFUL),
+        "update_todos": ("What todos or ideas would you like to add?", UPDATING_TODOS),
         "update_photos": (None, PHOTO),
         "update_checkboxes": (None, ASKING_CHECKBOXES),
         "update_emoji": (None, ASKING_EMOJI),
@@ -429,8 +443,9 @@ async def update_text_field(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     heading_map = {
         "memorable": "How was the day?",
-        "grateful": "Grateful for",
         "worries": "Worries",
+        "grateful": "Grateful for",
+        "todos": "Todos and ideas",
     }
     target_heading_text = heading_map.get(field)
     
@@ -476,11 +491,14 @@ async def update_text_field(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 async def update_memorable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await update_text_field(update, context, "memorable")
 
+async def update_worries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await update_text_field(update, context, "worries")
+
 async def update_grateful(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await update_text_field(update, context, "grateful")
 
-async def update_worries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await update_text_field(update, context, "worries")
+async def update_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await update_text_field(update, context, "todos")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -675,13 +693,15 @@ def main() -> None:
         states={
             ASKING_UPDATE: [MessageHandler(filters.Regex("^Yes, update it$") & user_filter, start_update), MessageHandler(filters.Regex("^No, cancel$") & user_filter, cancel_update)],
             MEMORABLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, memorable)],
-            GRATEFUL: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, grateful)],
             WORRIES: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, worries)],
+            GRATEFUL: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, grateful)],
+            TODOS: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, todos)],
             PHOTO: [MessageHandler(filters.PHOTO & user_filter, photo), MessageHandler(filters.Regex("^Done$") & user_filter, done_photo)],
             UPDATING_MENU: [CallbackQueryHandler(updating_menu_handler)], # CallbackQueryHandlers are already user-specific
             UPDATING_MEMORABLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, update_memorable)],
-            UPDATING_GRATEFUL: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, update_grateful)],
             UPDATING_WORRIES: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, update_worries)],
+            UPDATING_GRATEFUL: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, update_grateful)],
+            UPDATING_TODOS: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, update_todos)],
             ASKING_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, emoji), MessageHandler(filters.Regex("^Skip$") & user_filter, skip_emoji)],
             ASKING_CHECKBOXES: [CallbackQueryHandler(toggle_checkbox, pattern="^toggle_"), CallbackQueryHandler(done_checkboxes, pattern="^done_checkboxes$")],
         },
