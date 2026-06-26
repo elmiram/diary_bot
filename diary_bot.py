@@ -696,40 +696,54 @@ def sync_entries_from_notion(bot_data: dict) -> int:
     return len(synced)
 
 async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Displays a timeline of emojis used in the current year."""
+    """Displays an emoji timeline. Args: [rolling] [full] (order doesn't matter).
+
+    /emojis             — calendar year, emojis only
+    /emojis full        — calendar year, dot for every day
+    /emojis rolling     — trailing 12 months, emojis only
+    /emojis rolling full — trailing 12 months, dot for every day
+    """
     diary_entries = context.bot_data.get("diary_entries", {})
     today = datetime.now(TIMEZONE).date()
-    current_year = today.year
+    args = {a.lower() for a in (context.args or [])}
+    full_mode = "full" in args
+    rolling_mode = "rolling" in args
 
-    full_year_mode = context.args and context.args[0].lower() in ['full', 'all']
-
-    if full_year_mode:
-        start_of_year = date(current_year, 1, 1)
-        day_count = (today - start_of_year).days + 1
-        timeline_symbols = []
-        for i in range(day_count):
-            current_day = start_of_year + timedelta(days=i)
-            entry = diary_entries.get(current_day.isoformat())
-            timeline_symbols.append(entry['icon'] if entry and entry.get('icon') else '•')
-        await update.message.reply_text(f"Your {current_year} daily emoji timeline:\n{''.join(timeline_symbols)}")
-
+    if rolling_mode:
+        start_date = today - timedelta(days=365)
+        label = "Rolling 12 months"
     else:
-        year_entries = []
-        for iso_date, data in diary_entries.items():
-            if iso_date.startswith(str(current_year)) and data.get('icon'):
-                try:
-                    year_entries.append((date.fromisoformat(iso_date), data['icon']))
-                except ValueError:
-                    continue
+        start_date = date(today.year, 1, 1)
+        label = str(today.year)
 
-        if not year_entries:
+    if full_mode:
+        day_count = (today - start_date).days + 1
+        symbols = []
+        for i in range(day_count):
+            d = start_date + timedelta(days=i)
+            entry = diary_entries.get(d.isoformat())
+            symbols.append(entry["icon"] if entry and entry.get("icon") else "•")
+        await update.message.reply_text(f"{label} daily timeline:\n{''.join(symbols)}")
+    else:
+        entries = []
+        for iso_date, data in diary_entries.items():
+            if not data.get("icon"):
+                continue
+            try:
+                d = date.fromisoformat(iso_date)
+            except ValueError:
+                continue
+            if start_date <= d <= today:
+                entries.append((d, data["icon"]))
+
+        if not entries:
             await update.message.reply_text(
-                f"No emoji entries found for {current_year} yet! Try `/emojis full` to see the full year view."
+                f"No emoji entries found for {label.lower()} yet! Try adding `full` to see all days."
             )
             return
 
-        year_entries.sort()
-        await update.message.reply_text(f"Your {current_year} used emojis:\n{''.join(icon for _, icon in year_entries)}")
+        entries.sort()
+        await update.message.reply_text(f"{label} emojis:\n{''.join(icon for _, icon in entries)}")
 
 
 # --- Reminder and Scheduling Functions ---
