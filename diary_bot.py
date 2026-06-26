@@ -452,15 +452,36 @@ async def ask_photos(message, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     photo_file = await update.message.photo[-1].get_file()
+    # Send a single status message on the first photo; subsequent photos upload silently
+    if not context.user_data.get("photo_status_msg"):
+        status_msg = await update.message.reply_text("Uploading photos...")
+        context.user_data["photo_status_msg"] = status_msg
+
     image_bytes = await photo_file.download_as_bytearray()
     filename = f"photo_{len(context.user_data['photos']) + 1}.jpg"
     file_id = upload_image_to_notion(bytes(image_bytes), filename)
     if file_id:
         context.user_data["photos"].append({"type": "file_upload", "id": file_id})
-        await update.message.reply_text("Photo added! Send another, or press 'Done'.")
     else:
-        await update.message.reply_text("Failed to upload that photo to Notion. Try again or press 'Done' to skip it.")
+        context.user_data.setdefault("photo_failures", 0)
+        context.user_data["photo_failures"] += 1
     return PHOTO
+
+async def _finish_photo_upload(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Edits the upload status message with the final photo count and clears it from state."""
+    status_msg = context.user_data.pop("photo_status_msg", None)
+    failures = context.user_data.pop("photo_failures", 0)
+    count = len(context.user_data.get("photos", []))
+    if status_msg:
+        if count == 0:
+            text = "No photos were saved."
+        elif count == 1:
+            text = "1 photo saved!"
+        else:
+            text = f"{count} photos saved!"
+        if failures:
+            text += f" ({failures} failed to upload.)"
+        await status_msg.edit_text(text)
 
 async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles the 'Done' button in the photo step. For new entries, proceeds to the day questions."""
@@ -478,9 +499,10 @@ async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             # Automatically check the "Photos" box since photos were added
             update_payload = {"properties": {"Photos": {"checkbox": True}}}
             notion_api_request("patch", f"https://api.notion.com/v1/pages/{page_id}", json=update_payload)
-        await update.message.reply_text("Pics added!", reply_markup=ReplyKeyboardRemove())
+        await _finish_photo_upload(update.message, context)
         return await start_update(update.message, context)
     else:
+        await _finish_photo_upload(update.message, context)
         await update.message.reply_text("How was the day? You can write down anything you want here.", reply_markup=ReplyKeyboardRemove())
         return MEMORABLE
 
