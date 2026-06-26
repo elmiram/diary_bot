@@ -76,12 +76,47 @@ def notion_api_request(method, url, **kwargs):
             logger.error(f"Notion API response: {e.response.text}")
         return None
 
+def upload_image_to_notion(image_bytes: bytes, filename: str) -> str | None:
+    """Uploads image bytes to Notion file storage and returns the file_upload_id."""
+    auth_headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": "2026-03-11",
+    }
+    try:
+        # Step 1: create upload session
+        create_resp = requests.post(
+            "https://api.notion.com/v1/file_uploads",
+            headers={**auth_headers, "Content-Type": "application/json"},
+            json={"filename": filename, "content_type": "image/jpeg"},
+        )
+        create_resp.raise_for_status()
+        upload_data = create_resp.json()
+        file_id = upload_data["id"]
+        upload_url = upload_data["upload_url"]
+
+        # Step 2: send the bytes
+        send_resp = requests.post(
+            upload_url,
+            headers=auth_headers,
+            files={"file": (filename, image_bytes, "image/jpeg")},
+        )
+        send_resp.raise_for_status()
+        logger.info(f"Uploaded image to Notion: {file_id}")
+        return file_id
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to upload image to Notion: {e}")
+        return None
+
 def build_notion_page_content(user_data):
     """Builds the list of blocks for a Notion page from user data."""
     children = []
     if user_data.get("photos"):
-        for photo_url in user_data["photos"]:
-            children.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": photo_url}}})
+        for photo_item in user_data["photos"]:
+            if isinstance(photo_item, dict) and photo_item.get("type") == "file_upload":
+                children.append({"object": "block", "type": "image", "image": {"type": "file_upload", "file_upload": {"id": photo_item["id"]}}})
+            else:
+                # Fallback for any legacy external URLs
+                children.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": photo_item}}})
     if user_data.get("memorable"):
         children.extend([
             {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "How was the day?"}}]}},
@@ -417,8 +452,14 @@ async def ask_photos(message, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     photo_file = await update.message.photo[-1].get_file()
-    context.user_data["photos"].append(photo_file.file_path)
-    await update.message.reply_text("Photo added! Send another, or press 'Done'.")
+    image_bytes = await photo_file.download_as_bytearray()
+    filename = f"photo_{len(context.user_data['photos']) + 1}.jpg"
+    file_id = upload_image_to_notion(bytes(image_bytes), filename)
+    if file_id:
+        context.user_data["photos"].append({"type": "file_upload", "id": file_id})
+        await update.message.reply_text("Photo added! Send another, or press 'Done'.")
+    else:
+        await update.message.reply_text("Failed to upload that photo to Notion. Try again or press 'Done' to skip it.")
     return PHOTO
 
 async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -428,8 +469,11 @@ async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         page_id = context.bot_data.get("diary_entries", {}).get(today, {}).get('page_id')
         if page_id and context.user_data.get("photos"):
             new_photo_blocks = []
-            for photo_url in context.user_data["photos"]:
-                 new_photo_blocks.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": photo_url}}})
+            for photo_item in context.user_data["photos"]:
+                if isinstance(photo_item, dict) and photo_item.get("type") == "file_upload":
+                    new_photo_blocks.append({"object": "block", "type": "image", "image": {"type": "file_upload", "file_upload": {"id": photo_item["id"]}}})
+                else:
+                    new_photo_blocks.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": photo_item}}})
             append_to_notion_page(page_id, new_photo_blocks)
             # Automatically check the "Photos" box since photos were added
             update_payload = {"properties": {"Photos": {"checkbox": True}}}
