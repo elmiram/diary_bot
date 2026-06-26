@@ -697,19 +697,23 @@ def sync_entries_from_notion(bot_data: dict) -> int:
 
     return len(synced)
 
-def get_emojis_keyboard(r: str = "yr", c: str = "emo", g: str = "flat") -> InlineKeyboardMarkup:
-    """Builds the emoji view config keyboard. r=range, c=content, g=grouping."""
-    def btn(label, nr, nc, ng):
-        active = (nr == r and nc == c and ng == g)
-        return InlineKeyboardButton(("✅ " if active else "") + label, callback_data=f"emoj_{nr}_{nc}_{ng}_0")
-    return InlineKeyboardMarkup([
+def get_emojis_keyboard(r: str = "yr", c: str = "emo", g: str = "flat", l: str = "lbl") -> InlineKeyboardMarkup:
+    """Builds the emoji view config keyboard. r=range, c=content, g=grouping, l=labels."""
+    def btn(label, nr, nc, ng, nl=None):
+        nl = nl if nl is not None else l
+        active = (nr == r and nc == c and ng == g and nl == l)
+        return InlineKeyboardButton(("✅ " if active else "") + label, callback_data=f"emoj_{nr}_{nc}_{ng}_{nl}_0")
+    rows = [
         [btn("Calendar year", "yr", c, g),  btn("Rolling 12m", "roll", c, g)],
         [btn("Emojis only",  r, "emo", g),  btn("All days",    r, "all", g)],
         [btn("Flat", r, c, "flat"), btn("By month", r, c, "mon"), btn("By week", r, c, "wk")],
-        [InlineKeyboardButton("▶️ Show", callback_data=f"emoj_{r}_{c}_{g}_1")],
-    ])
+    ]
+    if g != "flat":
+        rows.append([btn("Show labels", r, c, g, "lbl"), btn("Hide labels", r, c, g, "nolbl")])
+    rows.append([InlineKeyboardButton("▶️ Show", callback_data=f"emoj_{r}_{c}_{g}_{l}_1")])
+    return InlineKeyboardMarkup(rows)
 
-def build_emoji_timeline(diary_entries: dict, r: str, c: str, g: str) -> str:
+def build_emoji_timeline(diary_entries: dict, r: str, c: str, g: str, l: str = "lbl") -> str:
     """Generates the emoji timeline text from the local cache."""
     today = datetime.now(TIMEZONE).date()
     if r == "yr":
@@ -730,6 +734,8 @@ def build_emoji_timeline(diary_entries: dict, r: str, c: str, g: str) -> str:
     def sym(icon):
         return icon if icon else ("•" if c == "all" else None)
 
+    show_labels = (l == "lbl")
+
     if g == "flat":
         symbols = [s for _, icon in days for s in [sym(icon)] if s]
         if not symbols:
@@ -743,8 +749,11 @@ def build_emoji_timeline(diary_entries: dict, r: str, c: str, g: str) -> str:
             symbols = [s for _, icon in grp for s in [sym(icon)] if s]
             if not symbols:
                 continue
-            lbl = f"{month_abbr[month]} {year}" if span_years else month_abbr[month]
-            lines.append(f"{lbl}: {''.join(symbols)}")
+            if show_labels:
+                lbl = f"{month_abbr[month]} {year}" if span_years else month_abbr[month]
+                lines.append(f"{lbl}: {''.join(symbols)}")
+            else:
+                lines.append(''.join(symbols))
         return (f"{title}:\n" + "\n".join(lines)) if lines else f"No entries found for {title.lower()}."
 
     else:  # g == "wk"
@@ -753,7 +762,10 @@ def build_emoji_timeline(diary_entries: dict, r: str, c: str, g: str) -> str:
             symbols = [s for _, icon in grp for s in [sym(icon)] if s]
             if not symbols:
                 continue
-            lines.append(f"{monday.strftime('%b %d')}: {''.join(symbols)}")
+            if show_labels:
+                lines.append(f"{monday.strftime('%b %d')}: {''.join(symbols)}")
+            else:
+                lines.append(''.join(symbols))
         return (f"{title}:\n" + "\n".join(lines)) if lines else f"No entries found for {title.lower()}."
 
 async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -766,12 +778,12 @@ async def emojis_option_callback(update: Update, context: ContextTypes.DEFAULT_T
     if query.from_user.id != int(YOUR_CHAT_ID):
         return
     await query.answer()
-    _, r, c, g, show = query.data.split("_")
+    _, r, c, g, l, show = query.data.split("_")
     if show == "1":
-        text = build_emoji_timeline(context.bot_data.get("diary_entries", {}), r, c, g)
-        await query.edit_message_text(text, reply_markup=get_emojis_keyboard(r, c, g))
+        text = build_emoji_timeline(context.bot_data.get("diary_entries", {}), r, c, g, l)
+        await query.edit_message_text(text, reply_markup=get_emojis_keyboard(r, c, g, l))
     else:
-        await query.edit_message_reply_markup(get_emojis_keyboard(r, c, g))
+        await query.edit_message_reply_markup(get_emojis_keyboard(r, c, g, l))
 
 
 # --- Reminder and Scheduling Functions ---
