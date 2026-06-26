@@ -1,6 +1,8 @@
 import logging
 import os
+from calendar import month_abbr
 from datetime import datetime, date, time, timedelta
+from itertools import groupby
 import threading
 import time as thread_time # Renamed to avoid conflict with datetime.time
 import re
@@ -695,55 +697,81 @@ def sync_entries_from_notion(bot_data: dict) -> int:
 
     return len(synced)
 
-async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Displays an emoji timeline. Args: [rolling] [full] (order doesn't matter).
+def get_emojis_keyboard(r: str = "yr", c: str = "emo", g: str = "flat") -> InlineKeyboardMarkup:
+    """Builds the emoji view config keyboard. r=range, c=content, g=grouping."""
+    def btn(label, nr, nc, ng):
+        active = (nr == r and nc == c and ng == g)
+        return InlineKeyboardButton(("✅ " if active else "") + label, callback_data=f"emoj_{nr}_{nc}_{ng}_0")
+    return InlineKeyboardMarkup([
+        [btn("Calendar year", "yr", c, g),  btn("Rolling 12m", "roll", c, g)],
+        [btn("Emojis only",  r, "emo", g),  btn("All days",    r, "all", g)],
+        [btn("Flat", r, c, "flat"), btn("By month", r, c, "mon"), btn("By week", r, c, "wk")],
+        [InlineKeyboardButton("▶️ Show", callback_data=f"emoj_{r}_{c}_{g}_1")],
+    ])
 
-    /emojis             — calendar year, emojis only
-    /emojis full        — calendar year, dot for every day
-    /emojis rolling     — trailing 12 months, emojis only
-    /emojis rolling full — trailing 12 months, dot for every day
-    """
-    diary_entries = context.bot_data.get("diary_entries", {})
+def build_emoji_timeline(diary_entries: dict, r: str, c: str, g: str) -> str:
+    """Generates the emoji timeline text from the local cache."""
     today = datetime.now(TIMEZONE).date()
-    args = {a.lower() for a in (context.args or [])}
-    full_mode = "full" in args
-    rolling_mode = "rolling" in args
-
-    if rolling_mode:
-        start_date = today - timedelta(days=365)
-        label = "Rolling 12 months"
-    else:
+    if r == "yr":
         start_date = date(today.year, 1, 1)
-        label = str(today.year)
-
-    if full_mode:
-        day_count = (today - start_date).days + 1
-        symbols = []
-        for i in range(day_count):
-            d = start_date + timedelta(days=i)
-            entry = diary_entries.get(d.isoformat())
-            symbols.append(entry["icon"] if entry and entry.get("icon") else "•")
-        await update.message.reply_text(f"{label} daily timeline:\n{''.join(symbols)}")
+        title = str(today.year)
     else:
-        entries = []
-        for iso_date, data in diary_entries.items():
-            if not data.get("icon"):
-                continue
-            try:
-                d = date.fromisoformat(iso_date)
-            except ValueError:
-                continue
-            if start_date <= d <= today:
-                entries.append((d, data["icon"]))
+        start_date = today - timedelta(days=365)
+        title = "Rolling 12 months"
 
-        if not entries:
-            await update.message.reply_text(
-                f"No emoji entries found for {label.lower()} yet! Try adding `full` to see all days."
-            )
-            return
+    days = []
+    d = start_date
+    while d <= today:
+        entry = diary_entries.get(d.isoformat())
+        icon = entry.get("icon") if entry else None
+        days.append((d, icon))
+        d += timedelta(days=1)
 
-        entries.sort()
-        await update.message.reply_text(f"{label} emojis:\n{''.join(icon for _, icon in entries)}")
+    def sym(icon):
+        return icon if icon else ("•" if c == "all" else None)
+
+    if g == "flat":
+        symbols = [s for _, icon in days for s in [sym(icon)] if s]
+        if not symbols:
+            return f"No entries found for {title.lower()}."
+        return f"{title}:\n{''.join(symbols)}"
+
+    elif g == "mon":
+        span_years = start_date.year != today.year
+        lines = []
+        for (year, month), grp in groupby(days, key=lambda x: (x[0].year, x[0].month)):
+            symbols = [s for _, icon in grp for s in [sym(icon)] if s]
+            if not symbols:
+                continue
+            lbl = f"{month_abbr[month]} {year}" if span_years else month_abbr[month]
+            lines.append(f"{lbl}: {''.join(symbols)}")
+        return (f"{title}:\n" + "\n".join(lines)) if lines else f"No entries found for {title.lower()}."
+
+    else:  # g == "wk"
+        lines = []
+        for monday, grp in groupby(days, key=lambda x: x[0] - timedelta(days=x[0].weekday())):
+            symbols = [s for _, icon in grp for s in [sym(icon)] if s]
+            if not symbols:
+                continue
+            lines.append(f"{monday.strftime('%b %d')}: {''.join(symbols)}")
+        return (f"{title}:\n" + "\n".join(lines)) if lines else f"No entries found for {title.lower()}."
+
+async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends the emoji view config keyboard."""
+    await update.message.reply_text("Configure your emoji view:", reply_markup=get_emojis_keyboard())
+
+async def emojis_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles button presses on the emoji config keyboard."""
+    query = update.callback_query
+    if query.from_user.id != int(YOUR_CHAT_ID):
+        return
+    await query.answer()
+    _, r, c, g, show = query.data.split("_")
+    if show == "1":
+        text = build_emoji_timeline(context.bot_data.get("diary_entries", {}), r, c, g)
+        await query.edit_message_text(text, reply_markup=get_emojis_keyboard(r, c, g))
+    else:
+        await query.edit_message_reply_markup(get_emojis_keyboard(r, c, g))
 
 
 # --- Reminder and Scheduling Functions ---
@@ -879,6 +907,7 @@ def main() -> None:
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("emojis", show_emojis, filters=user_filter))
+    application.add_handler(CallbackQueryHandler(emojis_option_callback, pattern="^emoj_"))
     application.add_handler(CommandHandler("stopreminders", stop_reminders, filters=user_filter))
     application.add_handler(CommandHandler("resumereminders", resume_reminders, filters=user_filter))
 
