@@ -651,59 +651,85 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- New Emoji Timeline Command ---
+# --- Emoji Timeline Command ---
+def sync_entries_from_notion(bot_data: dict) -> int:
+    """Fetches all Daily entries from Notion and replaces local cache. Returns total count synced."""
+    query_payload = {"filter": {"property": "Tags", "multi_select": {"contains": "Daily"}}}
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+
+    synced = {}
+    has_more = True
+    next_cursor = None
+
+    while has_more:
+        payload = dict(query_payload)
+        if next_cursor:
+            payload["start_cursor"] = next_cursor
+
+        response_data = notion_api_request("post", url, json=payload)
+        if not response_data:
+            logger.warning("Notion sync interrupted: API call failed.")
+            break
+
+        for page in response_data.get("results", []):
+            try:
+                page_id = page["id"]
+                icon_data = page.get("icon")
+                icon = icon_data.get("emoji") if icon_data else None
+                # Prefer the explicit Date property; fall back to created_time for older entries
+                date_prop = page.get("properties", {}).get("Date", {}).get("date")
+                if date_prop and date_prop.get("start"):
+                    iso_date = date_prop["start"]
+                else:
+                    created_time_str = page["created_time"]
+                    iso_date = datetime.fromisoformat(created_time_str.replace("Z", "+00:00")).date().isoformat()
+                synced[iso_date] = {"page_id": page_id, "icon": icon}
+            except (KeyError, ValueError):
+                continue
+
+        has_more = response_data.get("has_more", False)
+        next_cursor = response_data.get("next_cursor")
+
+    if synced:
+        bot_data["diary_entries"] = synced
+
+    return len(synced)
+
 async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays a timeline of emojis used in the current year."""
     diary_entries = context.bot_data.get("diary_entries", {})
     today = datetime.now(TIMEZONE).date()
     current_year = today.year
-    
-    # Check if the user wants the full year view (e.g., /emojis full)
+
     full_year_mode = context.args and context.args[0].lower() in ['full', 'all']
 
     if full_year_mode:
         start_of_year = date(current_year, 1, 1)
         day_count = (today - start_of_year).days + 1
-        
         timeline_symbols = []
         for i in range(day_count):
             current_day = start_of_year + timedelta(days=i)
-            iso_date = current_day.isoformat()
-            entry = diary_entries.get(iso_date)
-            
-            if entry and entry.get('icon'):
-                timeline_symbols.append(entry['icon'])
-            else:
-                timeline_symbols.append('•')
-        
-        emoji_timeline = "".join(timeline_symbols)
-        if not emoji_timeline:
-             await update.message.reply_text(f"No entries found for {current_year} yet!")
-             return
-        
-        await update.message.reply_text(f"Your {current_year} daily emoji timeline:\n{emoji_timeline}")
+            entry = diary_entries.get(current_day.isoformat())
+            timeline_symbols.append(entry['icon'] if entry and entry.get('icon') else '•')
+        await update.message.reply_text(f"Your {current_year} daily emoji timeline:\n{''.join(timeline_symbols)}")
 
-    else: # Default mode (only show used emojis)
+    else:
         year_entries = []
         for iso_date, data in diary_entries.items():
             if iso_date.startswith(str(current_year)) and data.get('icon'):
                 try:
-                    entry_date = date.fromisoformat(iso_date)
-                    year_entries.append((entry_date, data['icon']))
+                    year_entries.append((date.fromisoformat(iso_date), data['icon']))
                 except ValueError:
                     continue
-        
+
         if not year_entries:
             await update.message.reply_text(
-                f"No emoji entries found for {current_year} yet! "
-                f"Try `/emojis full` to see the full year view."
+                f"No emoji entries found for {current_year} yet! Try `/emojis full` to see the full year view."
             )
             return
-            
+
         year_entries.sort()
-        emoji_timeline = "".join([icon for dt, icon in year_entries])
-        
-        await update.message.reply_text(f"Your {current_year} used emojis:\n{emoji_timeline}")
+        await update.message.reply_text(f"Your {current_year} used emojis:\n{''.join(icon for _, icon in year_entries)}")
 
 
 # --- Reminder and Scheduling Functions ---
@@ -780,35 +806,11 @@ async def daily_prompt(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init_setup(application: Application) -> None:
     """Runs after the bot is initialized. Syncs from Notion and checks for missed prompts."""
-    # --- Sync from Notion on first run ---
-    if not application.bot_data.get('diary_entries'):
-        logger.info("Persistence file is empty. Syncing from Notion...")
-        query_payload = { "filter": { "property": "Tags", "multi_select": { "contains": "Daily" } } }
-        url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-        response_data = notion_api_request("post", url, json=query_payload)
-
-        if response_data:
-            synced_entries = {}
-            for page in response_data.get("results", []):
-                try:
-                    page_id = page['id']
-                    icon_data = page.get('icon')
-                    icon = icon_data.get('emoji') if icon_data else None
-                    created_time_str = page['created_time']
-                    entry_date = datetime.fromisoformat(created_time_str.replace("Z", "+00:00")).date()
-                    iso_date = entry_date.isoformat()
-                    synced_entries[iso_date] = {'page_id': page_id, 'icon': icon}
-                except (KeyError, IndexError, ValueError) as e:
-                    logger.warning(f"Skipping page during sync due to parsing error: {e}")
-                    continue
-            
-            application.bot_data['diary_entries'] = synced_entries
-            logger.info(f"Successfully synced {len(synced_entries)} entries from Notion.")
-            await application.persistence.flush()
-        else:
-            logger.warning("Could not fetch data from Notion for initial sync.")
-    else:
-        logger.info("Persistence file already contains data. Skipping Notion sync.")
+    logger.info("Syncing entries from Notion on startup...")
+    new_count = sync_entries_from_notion(application.bot_data)
+    if new_count:
+        await application.persistence.flush()
+    logger.info(f"Notion sync complete. {new_count} new entries added to local cache.")
 
     # --- Check for missed daily prompt on startup ---
     today = get_today_iso()
