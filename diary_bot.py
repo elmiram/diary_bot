@@ -544,10 +544,22 @@ async def show_emojis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --- Reminder and Scheduling Functions ---
+async def stop_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.bot_data["reminders_enabled"] = False
+    await update.message.reply_text("Got it, I'll stop sending daily reminders. Use /resumereminders to turn them back on.")
+
+async def resume_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.bot_data["reminders_enabled"] = True
+    await update.message.reply_text("Daily reminders are back on!")
+
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id, current_reminder = job.chat_id, job.data.get("reminder_count", 0)
-    
+
+    if not context.bot_data.get("reminders_enabled", True):
+        logger.info("Skipping reminder as reminders are disabled.")
+        return
+
     if context.bot_data.get("diary_entries", {}).get(get_today_iso()):
         logger.info("Skipping reminder as an entry for today already exists.")
         return
@@ -569,6 +581,10 @@ async def daily_prompt(context: ContextTypes.DEFAULT_TYPE):
     """The job function for the daily prompt. Retries on network failure."""
     chat_id = context.job.chat_id
     retry_count = context.job.data.get("retry_count", 0) if context.job.data else 0
+
+    if not context.bot_data.get("reminders_enabled", True):
+        logger.info("Skipping daily prompt as reminders are disabled.")
+        return
 
     if context.bot_data.get("diary_entries", {}).get(get_today_iso()):
         return
@@ -677,6 +693,8 @@ def main() -> None:
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("emojis", show_emojis, filters=user_filter))
+    application.add_handler(CommandHandler("stopreminders", stop_reminders, filters=user_filter))
+    application.add_handler(CommandHandler("resumereminders", resume_reminders, filters=user_filter))
 
     # Schedule the daily prompt using the built-in JobQueue
     job_queue = application.job_queue
