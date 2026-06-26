@@ -49,7 +49,8 @@ logger = logging.getLogger(__name__)
     UPDATING_TODOS,
     ASKING_EMOJI,
     ASKING_CHECKBOXES,
-) = range(13)
+    ASKING_SCORE,
+) = range(14)
 
 # --- Notion API Functions ---
 
@@ -115,6 +116,8 @@ def create_notion_page(user_data, context: ContextTypes.DEFAULT_TYPE):
         "Tears": {"checkbox": user_data.get("checkbox_tears", False)},
         "Photos": {"checkbox": bool(user_data.get("photos"))},
     }
+    if user_data.get("score") is not None:
+        properties["Score"] = {"number": user_data["score"]}
     payload = {
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": properties,
@@ -188,12 +191,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ASKING_UPDATE
     else:
-        await update.message.reply_text(
-            "Hi! Let's get started with today's entry.\n\n"
-            "How was the day? You can write down anything you want here.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return MEMORABLE
+        await update.message.reply_text("Hi! Let's get started with today's entry.", reply_markup=ReplyKeyboardRemove())
+        return await ask_photos(update.message, context)
 
 async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Shows the menu for what to update."""
@@ -228,6 +227,7 @@ async def memorable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WORRIES
 
 async def worries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Stores worries and proceeds to ask what the user is grateful for."""
     text = update.message.text
     if text.lower() not in ['none', 'no', 'nope']:
         context.user_data["worries"] = text
@@ -335,7 +335,7 @@ async def emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             entry_data['icon'] = context.user_data.get("icon")
         return await start_update(update.message, context)
     else:
-        return await ask_photos(update.message, context)
+        return await ask_score(update.message, context)
 
 async def skip_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Skips the emoji step."""
@@ -343,7 +343,7 @@ async def skip_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.user_data.get("is_update"):
         return await start_update(update.message, context)
     else:
-        return await ask_photos(update.message, context)
+        return await ask_score(update.message, context)
 
 # --- Photo Handling ---
 async def ask_photos(message, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -364,7 +364,7 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return PHOTO
 
 async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Finishes the diary entry and saves to Notion."""
+    """Handles the 'Done' button in the photo step. For new entries, proceeds to the day questions."""
     if context.user_data.get("is_update"):
         today = get_today_iso()
         page_id = context.bot_data.get("diary_entries", {}).get(today, {}).get('page_id')
@@ -379,13 +379,34 @@ async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Pics added!", reply_markup=ReplyKeyboardRemove())
         return await start_update(update.message, context)
     else:
-        create_notion_page(context.user_data, context)
-        reply_markup = ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text(
-            "I've saved your new diary entry to Notion. Talk to you tomorrow!",
-            reply_markup=reply_markup
-        )
-        return ConversationHandler.END
+        await update.message.reply_text("How was the day? You can write down anything you want here.", reply_markup=ReplyKeyboardRemove())
+        return MEMORABLE
+
+async def ask_score(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Asks the user to rate their day."""
+    await message.reply_text("Last step! How would you rate today? (1–10, decimals like 7.5 are fine)")
+    return ASKING_SCORE
+
+async def score_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles score input as free text."""
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        value = float(text)
+        if not (1 <= value <= 10):
+            raise ValueError
+        context.user_data["score"] = value
+        await update.message.reply_text(f"Score set to {value}!", reply_markup=ReplyKeyboardRemove())
+    except ValueError:
+        await update.message.reply_text("Please enter a number between 1 and 10 (e.g. 7 or 8.5).")
+        return ASKING_SCORE
+    return await save_entry(update.message, context)
+
+async def save_entry(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Creates the Notion page and ends the conversation."""
+    create_notion_page(context.user_data, context)
+    reply_markup = ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
+    await message.reply_text("I've saved your new diary entry to Notion. Talk to you tomorrow!", reply_markup=reply_markup)
+    return ConversationHandler.END
 
 # --- Update Flow Handlers ---
 async def updating_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -704,6 +725,7 @@ def main() -> None:
             UPDATING_TODOS: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, update_todos)],
             ASKING_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, emoji), MessageHandler(filters.Regex("^Skip$") & user_filter, skip_emoji)],
             ASKING_CHECKBOXES: [CallbackQueryHandler(toggle_checkbox, pattern="^toggle_"), CallbackQueryHandler(done_checkboxes, pattern="^done_checkboxes$")],
+            ASKING_SCORE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, score_text)],
         },
         fallbacks=[CommandHandler("cancel", cancel, filters=user_filter)],
         persistent=True,
